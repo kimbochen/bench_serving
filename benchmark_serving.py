@@ -461,6 +461,8 @@ async def benchmark(
                                      pbar=pbar)))
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
 
+    benchmark_duration = time.perf_counter() - benchmark_start_time
+    
     if profile:
         print("Stopping profiler...")
         profile_input = RequestFuncInput(
@@ -478,8 +480,6 @@ async def benchmark(
 
     if pbar is not None:
         pbar.close()
-
-    benchmark_duration = time.perf_counter() - benchmark_start_time
 
     metrics, actual_output_lens = calculate_metrics(
         input_requests=input_requests,
