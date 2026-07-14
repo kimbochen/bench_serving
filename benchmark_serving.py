@@ -29,6 +29,7 @@ import base64
 import gc
 import io
 import json
+import logging
 import os
 import random
 import time
@@ -59,6 +60,7 @@ except ImportError:
 from benchmark_utils import convert_to_pytorch_benchmark_format
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -417,6 +419,121 @@ def sample_random_requests(
                                int(output_lens[i]), None))
 
     return input_requests
+
+
+def gen_prompt_decode_to_target_len(
+    tokenizer: PreTrainedTokenizerBase,
+    token_sequence: List[int],
+    target_token_len: int,
+    max_retry: int = 10,
+    add_special_tokens: bool = False,
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[str, List[int], int]:
+    """
+    Ensure decoded-then-encoded prompt length matches the target token length.
+
+    This function decodes an initial token sequence to text and re-encodes it,
+    iteratively adjusting the token sequence length to match a target.
+    """
+    remain_num_try = max_retry
+    token_mismatch = 0
+    while True:
+        prompt = tokenizer.decode(token_sequence)
+        token_sequence = tokenizer.encode(
+            prompt, add_special_tokens=add_special_tokens)
+        if remain_num_try <= 0:
+            if len(token_sequence) != target_token_len:
+                token_mismatch = len(token_sequence) - target_token_len
+            break
+
+        if len(token_sequence) == target_token_len:
+            break
+        elif len(token_sequence) < target_token_len:
+            if rng is not None:
+                extra_tokens = rng.integers(
+                    0,
+                    tokenizer.vocab_size,
+                    size=target_token_len - len(token_sequence),
+                ).tolist()
+            else:
+                extra_tokens = np.random.randint(
+                    0,
+                    tokenizer.vocab_size,
+                    size=target_token_len - len(token_sequence),
+                ).tolist()
+            token_sequence.extend(extra_tokens)
+        elif len(token_sequence) > target_token_len:
+            token_sequence = token_sequence[:target_token_len]
+
+        remain_num_try -= 1
+
+    return prompt, token_sequence, token_mismatch
+
+
+def sample_prefix_repetition_requests(
+    prefix_len: int,
+    suffix_len: int,
+    output_len: int,
+    num_requests: int,
+    num_prefixes: int,
+    tokenizer: PreTrainedTokenizerBase,
+    disable_shuffle: bool = False,
+) -> List[Tuple[str, int, int, None]]:
+    vocab_size = tokenizer.vocab_size
+    prompts_per_prefix = num_requests // num_prefixes
+    if prompts_per_prefix == 0:
+        raise ValueError(
+            f"num_requests ({num_requests}) must be greater than or equal to "
+            f"num_prefixes ({num_prefixes})")
+
+    def _generate_exact_length_tokens(
+            target_length: int) -> Tuple[List[int], int]:
+        """Generate tokens that decode and re-encode to exactly target_length."""
+        # Generate random tokens
+        tokens = np.random.randint(0, vocab_size, size=target_length).tolist()
+
+        _, adjusted_tokens, token_mismatch = gen_prompt_decode_to_target_len(
+            tokenizer=tokenizer,
+            token_sequence=tokens,
+            target_token_len=target_length,
+            add_special_tokens=False,
+        )
+        return adjusted_tokens, token_mismatch
+
+    requests = []
+    token_mismatch_total = 0
+    for _ in range(num_prefixes):
+        prefix_tokens, prefix_mismatch = _generate_exact_length_tokens(
+            prefix_len)
+        token_mismatch_total += prefix_mismatch
+
+        for _ in range(prompts_per_prefix):
+            suffix_tokens, suffix_mismatch = _generate_exact_length_tokens(
+                suffix_len)
+            token_mismatch_total += suffix_mismatch
+            combined_tokens = prefix_tokens + suffix_tokens
+            prompt = tokenizer.decode(combined_tokens)
+            prompt_len = len(combined_tokens)
+            requests.append((
+                prompt,
+                prompt_len,
+                output_len,
+                None,
+            ))
+
+    if token_mismatch_total != 0:
+        sign = "more" if token_mismatch_total > 0 else "fewer"
+        logger.warning(
+            "Across all generated prompts, there were %d %s tokens "
+            "than expected after decoding and re-encoding. This is "
+            "expected due to the imperfect nature of the sampling "
+            "procedure.",
+            abs(token_mismatch_total),
+            sign,
+        )
+    if not disable_shuffle:
+        random.shuffle(requests)
+    return requests
 
 
 async def get_request(
@@ -998,6 +1115,17 @@ def main(args: argparse.Namespace):
             use_chat_template=args.use_chat_template,
         )
 
+    elif args.dataset_name == "prefix_repetition":
+        input_requests = sample_prefix_repetition_requests(
+            prefix_len=args.prefix_repetition_prefix_len,
+            suffix_len=args.prefix_repetition_suffix_len,
+            output_len=args.prefix_repetition_output_len,
+            num_requests=args.num_prompts,
+            num_prefixes=args.prefix_repetition_num_prefixes,
+            tokenizer=tokenizer,
+            disable_shuffle=args.disable_shuffle,
+        )
+
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
@@ -1125,7 +1253,14 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf"],
+        choices=[
+            "sharegpt",
+            "burstgpt",
+            "sonnet",
+            "random",
+            "hf",
+            "prefix_repetition",
+        ],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument("--dataset-path",
@@ -1282,6 +1417,11 @@ if __name__ == "__main__":
         "\"ttft\", \"tpot\", \"e2el\". For more context on the definition of "
         "goodput, refer to DistServe paper: https://arxiv.org/pdf/2401.09670 "
         "and the blog: https://hao-ai-lab.github.io/blogs/distserve")
+    parser.add_argument(
+        "--disable-shuffle",
+        action="store_true",
+        help="Disable shuffling of dataset samples for deterministic ordering.",
+    )
 
     # group for dataset specific arguments
     sonnet_group = parser.add_argument_group("sonnet dataset options")
@@ -1349,6 +1489,38 @@ if __name__ == "__main__":
         "--use-chat-template",
         action="store_true",
         help="Use chat template to format the prompt.",
+    )
+
+    prefix_repetition_group = parser.add_argument_group(
+        "prefix repetition dataset options"
+    )
+    prefix_repetition_group.add_argument(
+        "--prefix-repetition-prefix-len",
+        type=int,
+        default=256,
+        help="Number of prefix tokens per request, used only for prefix "
+        "repetition dataset.",
+    )
+    prefix_repetition_group.add_argument(
+        "--prefix-repetition-suffix-len",
+        type=int,
+        default=256,
+        help="Number of suffix tokens per request, used only for prefix "
+        "repetition dataset. Total input length is prefix_len + suffix_len.",
+    )
+    prefix_repetition_group.add_argument(
+        "--prefix-repetition-num-prefixes",
+        type=int,
+        default=10,
+        help="Number of prefixes to generate, used only for prefix repetition "
+        "dataset. Prompts per prefix is num_requests // num_prefixes.",
+    )
+    prefix_repetition_group.add_argument(
+        "--prefix-repetition-output-len",
+        type=int,
+        default=128,
+        help="Number of output tokens per request, used only for prefix "
+        "repetition dataset.",
     )
 
     hf_group = parser.add_argument_group("hf dataset options")
