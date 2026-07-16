@@ -73,6 +73,8 @@ class RequestFuncOutput:
     latency: float = 0.0
     output_tokens: int = 0
     ttft: float = 0.0  # Time to first token
+    request_start_time: Optional[float] = None
+    first_token_time: Optional[float] = None
     itl: List[float] = field(
         default_factory=list)  # List of inter-token latencies
     tpot: float = 0.0  # avg next-token latencies
@@ -107,6 +109,7 @@ async def async_request_tgi(
 
         ttft = 0.0
         st = time.perf_counter()
+        output.request_start_time = st
         most_recent_timestamp = st
         try:
             async with session.post(url=api_url, json=payload) as response:
@@ -127,8 +130,9 @@ async def async_request_tgi(
                         timestamp = time.perf_counter()
                         # First token
                         if ttft == 0.0:
-                            ttft = time.perf_counter() - st
+                            ttft = timestamp - st
                             output.ttft = ttft
+                            output.first_token_time = timestamp
 
                         # Decoding phase
                         else:
@@ -178,6 +182,7 @@ async def async_request_trt_llm(
 
         ttft = 0.0
         st = time.perf_counter()
+        output.request_start_time = st
         most_recent_timestamp = st
         try:
             async with session.post(url=api_url, json=payload) as response:
@@ -197,6 +202,7 @@ async def async_request_trt_llm(
                         if ttft == 0.0:
                             ttft = timestamp - st
                             output.ttft = ttft
+                            output.first_token_time = timestamp
 
                         # Decoding phase
                         else:
@@ -244,6 +250,7 @@ async def async_request_deepspeed_mii(
         output.ttft = 0
 
         st = time.perf_counter()
+        output.request_start_time = st
         try:
             async with session.post(url=request_func_input.api_url,
                                     json=payload) as response:
@@ -302,6 +309,7 @@ async def async_request_openai_completions(
 
         generated_text = ""
         st = time.perf_counter()
+        output.request_start_time = st
         most_recent_timestamp = st
         try:
             async with session.post(url=api_url, json=payload,
@@ -339,8 +347,9 @@ async def async_request_openai_completions(
                                 # First token
                                 if not first_chunk_received:
                                     first_chunk_received = True
-                                    ttft = time.perf_counter() - st
+                                    ttft = timestamp - st
                                     output.ttft = ttft
+                                    output.first_token_time = timestamp
 
                                 # Decoding phase
                                 else:
@@ -419,6 +428,7 @@ async def async_request_openai_chat_completions(
         generated_text = ""
         ttft = 0.0
         st = time.perf_counter()
+        output.request_start_time = st
         most_recent_timestamp = st
         try:
             async with session.post(url=api_url, json=payload,
@@ -456,6 +466,7 @@ async def async_request_openai_chat_completions(
                                 if ttft == 0.0:
                                     ttft = timestamp - st
                                     output.ttft = ttft
+                                    output.first_token_time = timestamp
 
                                 # Decoding phase
                                 else:
@@ -535,6 +546,7 @@ async def async_request_gimlet(
         generated_text = ""
         ttft = 0.0
         st = time.perf_counter()
+        output.request_start_time = st
         most_recent_timestamp = st
         try:
             async with session.post(url=api_url, json=payload,
@@ -557,6 +569,7 @@ async def async_request_gimlet(
                                 if ttft == 0.0:
                                     ttft = timestamp - st
                                     output.ttft = ttft
+                                    output.first_token_time = timestamp
 
                                 # Decoding phase
                                 else:

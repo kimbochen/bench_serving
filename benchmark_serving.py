@@ -93,6 +93,14 @@ class BenchmarkMetrics:
     percentiles_e2el_ms: List[Tuple[float, float]]
 
 
+@dataclass
+class PrefillMetrics:
+    completed: int
+    total_input: int
+    window_s: float
+    total_tps: float
+
+
 def sample_sharegpt_requests(
     dataset_path: str,
     num_requests: int,
@@ -580,6 +588,41 @@ async def get_request(
         await asyncio.sleep(interval)
 
 
+def calculate_prefill_metrics(
+    input_requests: List[Tuple[str, int, int]],
+    outputs: List[RequestFuncOutput],
+) -> PrefillMetrics:
+    """Calculate aggregate input-token throughput through the last first token."""
+    completed = 0
+    total_input = 0
+    prefill_start = float("inf")
+    prefill_end = 0.0
+
+    for i, output in enumerate(outputs):
+        if (not output.success or output.request_start_time is None
+                or output.first_token_time is None):
+            continue
+
+        completed += 1
+        total_input += input_requests[i][1]
+        prefill_start = min(prefill_start, output.request_start_time)
+        prefill_end = max(prefill_end, output.first_token_time)
+
+    prefill_window_s = prefill_end - prefill_start
+    if completed == 0 or prefill_window_s <= 0:
+        prefill_window_s = 0.0
+        total_prefill_tps = 0.0
+    else:
+        total_prefill_tps = total_input / prefill_window_s
+
+    return PrefillMetrics(
+        completed=completed,
+        total_input=total_input,
+        window_s=prefill_window_s,
+        total_tps=total_prefill_tps,
+    )
+
+
 def calculate_metrics(
     input_requests: List[Tuple[str, int, int]],
     outputs: List[RequestFuncOutput],
@@ -872,6 +915,10 @@ async def benchmark(
         selected_percentiles=selected_percentiles,
         goodput_config_dict=goodput_config_dict,
     )
+    prefill_metrics = calculate_prefill_metrics(
+        input_requests=input_requests,
+        outputs=outputs,
+    )
 
     print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
@@ -889,12 +936,22 @@ async def benchmark(
                                     metrics.output_throughput))
     print("{:<40} {:<10.2f}".format("Total Token throughput (tok/s):",
                                     metrics.total_token_throughput))
+    print("{:<40} {:<10}".format("Prefill completed requests:",
+                                 prefill_metrics.completed))
+    print("{:<40} {:<10.2f}".format("Prefill window (s):",
+                                    prefill_metrics.window_s))
+    print("{:<40} {:<10.2f}".format("Total prefill throughput (tok/s):",
+                                    prefill_metrics.total_tps))
 
     result = {
         "duration": benchmark_duration,
         "completed": metrics.completed,
         "total_input_tokens": metrics.total_input,
         "total_output_tokens": metrics.total_output,
+        "prefill_completed": prefill_metrics.completed,
+        "prefill_input_tokens": prefill_metrics.total_input,
+        "prefill_window_s": prefill_metrics.window_s,
+        "total_prefill_tps": prefill_metrics.total_tps,
         "request_throughput": metrics.request_throughput,
         "request_goodput:":
         metrics.request_goodput if goodput_config_dict else None,
@@ -903,6 +960,10 @@ async def benchmark(
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
+        "request_start_times": [
+            output.request_start_time for output in outputs
+        ],
+        "first_token_times": [output.first_token_time for output in outputs],
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
